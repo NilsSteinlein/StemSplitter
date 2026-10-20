@@ -13,17 +13,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: windows-x64,          os: windows-latest, cmake_args: "" }
-          - { name: windows-x64-directml, os: windows-latest, cmake_args: "-DSTEMSPLITTER_DIRECTML=ON" }
+          - { name: windows-x64,          os: windows-latest, cmake_args: "", parallel: 4 }
+          - { name: windows-x64-directml, os: windows-latest, cmake_args: "-DSTEMSPLITTER_DIRECTML=ON", parallel: 4 }
+          # Native arm64 for Apple Silicon. The universal ONNX Runtime build is
+          # downloaded by CMake and dlopened from inside the VST3 bundle.
+          - { name: macos-arm64,          os: macos-latest,   cmake_args: "-DCMAKE_OSX_ARCHITECTURES=arm64", parallel: 3 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
 
       - name: Build
-        run: cmake --build build --config Release --parallel 4
+        run: cmake --build build --config Release --parallel ${{ matrix.parallel }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -34,15 +41,53 @@ jobs:
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
+          VST3="build/StemSplitter_artefacts/Release/VST3/Stem Splitter.vst3"
+          if [ ! -d "$VST3" ]; then
+            VST3=$(find build -type d -name "Stem Splitter.vst3" | head -n 1)
+          fi
+          test -n "$VST3" && test -d "$VST3"
           mkdir -p "dist/Stem Splitter"
-          cp -R "build/StemSplitter_artefacts/Release/VST3/Stem Splitter.vst3" "dist/Stem Splitter/"
+          cp -R "$VST3" "dist/Stem Splitter/"
           # Both AI models go inside the bundle, where the plugin finds them automatically
           mkdir -p "dist/Stem Splitter/Stem Splitter.vst3/Contents/Resources"
           cp models/*.onnx "dist/Stem Splitter/Stem Splitter.vst3/Contents/Resources/"
           ls -la "dist/Stem Splitter/Stem Splitter.vst3/Contents/Resources/"
           mkdir -p "dist/Stem Splitter/cli"
-          cp -R build/StemSplitterCli_artefacts/Release/* "dist/Stem Splitter/cli/"
+          CLI_DIR="build/StemSplitterCli_artefacts/Release"
+          if [ ! -d "$CLI_DIR" ]; then
+            CLI_DIR=$(find build -type d -path "*StemSplitterCli_artefacts*" | head -n 1)
+          fi
+          cp -R "$CLI_DIR"/. "dist/Stem Splitter/cli/"
           cp README.md LICENSE THIRD_PARTY_NOTICES.md "dist/Stem Splitter/"
+          if [ "$(uname)" = "Darwin" ]; then
+            # Models are copied after the build's codesign, so sign the finished bundle.
+            codesign --force --deep --sign - "dist/Stem Splitter/Stem Splitter.vst3"
+            codesign --verify --strict --verbose=2 "dist/Stem Splitter/Stem Splitter.vst3"
+            BIN="dist/Stem Splitter/Stem Splitter.vst3/Contents/MacOS/Stem Splitter"
+            file "$BIN"
+            lipo -info "$BIN"
+            lipo -info "$BIN" | grep -q arm64
+            test -f "dist/Stem Splitter/Stem Splitter.vst3/Contents/MacOS/libonnxruntime.dylib"
+            test -f "dist/Stem Splitter/Stem Splitter.vst3/Contents/Resources/htdemucs.onnx"
+            test -f "dist/Stem Splitter/Stem Splitter.vst3/Contents/Resources/htdemucs_6s.onnx"
+            python3 - << 'PY'
+          from pathlib import Path
+          Path("dist/Stem Splitter/install-on-mac.command").write_text("""#!/bin/bash
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          DEST="$HOME/Library/Audio/Plug-Ins/VST3"
+          mkdir -p "$DEST"
+          rm -rf "$DEST/Stem Splitter.vst3"
+          cp -R "Stem Splitter.vst3" "$DEST/"
+          xattr -dr com.apple.quarantine "$DEST/Stem Splitter.vst3" || true
+          codesign --force --deep --sign - "$DEST/Stem Splitter.vst3"
+          echo "Installed to $DEST/Stem Splitter.vst3"
+          echo "In FL Studio: Options -> Manage plugins -> Find installed plugins, then rescan."
+          """)
+          PY
+            chmod +x "dist/Stem Splitter/install-on-mac.command"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
